@@ -169,12 +169,37 @@ pub fn fetchBuildDepends(io: Io, gpa: mem.Allocator, pkg: PackageDefinition) ![]
     return sysroot_target;
 }
 
+pub fn normalizeSubPath(allocator: mem.Allocator, sub_path: []const u8) ![]const u8 {
+    var p = sub_path;
+    while (mem.startsWith(u8, p, "./")) p = p[2..];
+    while (mem.startsWith(u8, p, "/")) p = p[1..];
+    while (mem.endsWith(u8, p, "/")) p = p[0 .. p.len - 1];
+    return try allocator.dupe(u8, p);
+}
+
 pub fn isExcluded(path: []const u8, files: []const []const u8, exts: []const []const u8) bool {
+    var p = path;
+    while (mem.startsWith(u8, p, "./")) p = p[2..];
+    while (mem.startsWith(u8, p, "/")) p = p[1..];
+
     for (files) |f| {
-        if (mem.indexOf(u8, path, f) != null) return true;
+        var clean_f = f;
+        while (mem.startsWith(u8, clean_f, "./")) clean_f = clean_f[2..];
+        while (mem.startsWith(u8, clean_f, "/")) clean_f = clean_f[1..];
+
+        if (mem.indexOfScalar(u8, clean_f, '/') != null) {
+            if (mem.eql(u8, p, clean_f) or mem.endsWith(u8, p, clean_f) or matchWildcard(clean_f, p)) return true;
+        } else {
+            const base = std.fs.path.basename(p);
+            if (mem.eql(u8, base, clean_f) or matchWildcard(clean_f, base)) return true;
+            var it = mem.splitScalar(u8, p, '/');
+            while (it.next()) |comp| {
+                if (mem.eql(u8, comp, clean_f)) return true;
+            }
+        }
     }
     for (exts) |ext| {
-        if (mem.endsWith(u8, path, ext)) return true;
+        if (mem.endsWith(u8, p, ext)) return true;
     }
     return false;
 }
@@ -328,6 +353,7 @@ pub fn packageGeneric(io: Io, gpa: mem.Allocator, pkg: PackageDefinition) ![]u8 
     for (pkg.file_mappings) |mapping| {
         const resolved_src_pattern = try resolvePathVarsWithSysroot(b.arena.allocator(), mapping.src, pkg.architecture, sysroot_path);
         const resolved_dest = try resolvePathVarsWithSysroot(b.arena.allocator(), mapping.dest, pkg.architecture, sysroot_path);
+        const norm_dest = try normalizeSubPath(b.arena.allocator(), resolved_dest);
 
         const expanded_srcs = try expandPathGlobs(io, b.arena.allocator(), resolved_src_pattern);
 
@@ -336,24 +362,33 @@ pub fn packageGeneric(io: Io, gpa: mem.Allocator, pkg: PackageDefinition) ![]u8 
             var src_dir = Io.Dir.cwd().openDir(io, resolved_src, .{ .iterate = true }) catch {
                 // If opening as dir fails, treat as a single file
                 if (Io.Dir.cwd().readFileAlloc(io, resolved_src, b.arena.allocator(), .unlimited)) |content| {
-                    var target_path: []const u8 = resolved_dest;
+                    var target_path: []const u8 = norm_dest;
                     if (target_path.len == 0) {
                         target_path = std.fs.path.basename(resolved_src);
-                    } else if (mem.endsWith(u8, target_path, "/")) {
-                        target_path = try std.fs.path.join(b.arena.allocator(), &.{ target_path, std.fs.path.basename(resolved_src) });
+                    } else if (mem.endsWith(u8, resolved_dest, "/") or expanded_srcs.len > 1 or mem.indexOfScalar(u8, mapping.src, '*') != null) {
+                        target_path = try std.fs.path.join(b.arena.allocator(), &.{ norm_dest, std.fs.path.basename(resolved_src) });
+                    }
+
+                    const clean_target = try normalizeSubPath(b.arena.allocator(), target_path);
+
+                    // Apply Exclusions
+                    if (isExcluded(resolved_src, mapping.exclude_files, mapping.exclude_extensions) or
+                        isExcluded(clean_target, mapping.exclude_files, mapping.exclude_extensions))
+                    {
+                        continue;
                     }
 
                     var mode: u32 = mapping.mode orelse 0o644;
                     if (mapping.mode == null) {
                         for (mapping.executable_patterns) |pat| {
-                            if (mem.indexOf(u8, target_path, pat) != null or mem.indexOf(u8, resolved_src, pat) != null) {
+                            if (mem.indexOf(u8, clean_target, pat) != null or mem.indexOf(u8, resolved_src, pat) != null) {
                                 mode = 0o755;
                                 break;
                             }
                         }
                     }
 
-                    try file_map.put(b.arena.allocator(), target_path, .{ .content = content, .mode = mode });
+                    try file_map.put(b.arena.allocator(), clean_target, .{ .content = content, .mode = mode });
                 } else |_| {}
                 continue;
             };
@@ -369,23 +404,25 @@ pub fn packageGeneric(io: Io, gpa: mem.Allocator, pkg: PackageDefinition) ![]u8 
                 if (isExcluded(entry.path, mapping.exclude_files, mapping.exclude_extensions)) continue;
 
                 const content = try src_dir.readFileAlloc(io, entry.path, b.arena.allocator(), .unlimited);
-                const target_path = if (resolved_dest.len == 0)
-                    entry.path
+                const target_path = if (norm_dest.len == 0)
+                    try b.arena.allocator().dupe(u8, entry.path)
                 else
-                    try std.fs.path.join(b.arena.allocator(), &.{ resolved_dest, entry.path });
+                    try std.fs.path.join(b.arena.allocator(), &.{ norm_dest, entry.path });
+
+                const clean_target = try normalizeSubPath(b.arena.allocator(), target_path);
 
                 // Determine File Mode
                 var mode: u32 = mapping.mode orelse 0o644;
                 if (mapping.mode == null) {
                     for (mapping.executable_patterns) |pat| {
-                        if (mem.indexOf(u8, target_path, pat) != null or mem.indexOf(u8, entry.path, pat) != null) {
+                        if (mem.indexOf(u8, clean_target, pat) != null or mem.indexOf(u8, entry.path, pat) != null) {
                             mode = 0o755;
                             break;
                         }
                     }
                 }
 
-                try file_map.put(b.arena.allocator(), target_path, .{ .content = content, .mode = mode });
+                try file_map.put(b.arena.allocator(), clean_target, .{ .content = content, .mode = mode });
             }
         }
     }
@@ -1075,3 +1112,55 @@ test "Manifest and PackageDefinition suite and mirror configuration" {
     try testing.expectEqualStrings("sid", pkg_override.suite orelse (manifest.suite orelse "bookworm"));
     try testing.expectEqualStrings("https://sid.debian.org", pkg_override.mirror orelse (manifest.mirror orelse "http://deb.debian.org/debian"));
 }
+
+test "packageGeneric handles empty dest and leading slash without duplicate entries or path corruption" {
+    const testing = std.testing;
+    const test_io = testing.io;
+    const test_gpa = testing.allocator;
+
+    const test_root_src = "test_empty_dest_root_fs";
+    try Io.Dir.cwd().createDirPath(test_io, test_root_src ++ "/etc/service");
+    try Io.Dir.cwd().createDirPath(test_io, test_root_src ++ "/opt/myorg");
+    defer Io.Dir.cwd().deleteTree(test_io, test_root_src) catch {};
+
+    {
+        var f1 = try Io.Dir.cwd().createFile(test_io, test_root_src ++ "/etc/service/service.conf", .{});
+        defer f1.close(test_io);
+        try f1.writeStreamingAll(test_io, "service-config");
+    }
+    {
+        var f2 = try Io.Dir.cwd().createFile(test_io, test_root_src ++ "/opt/myorg/app.bin", .{});
+        defer f2.close(test_io);
+        try f2.writeStreamingAll(test_io, "app-binary-data");
+    }
+
+    const test_deb = "packages/test_empty_dest_1.0.0_amd64.deb";
+    defer Io.Dir.cwd().deleteFile(test_io, test_deb) catch {};
+
+    const pkg = PackageDefinition{
+        .name = "test-empty-dest",
+        .version = "1.0.0",
+        .architecture = "amd64",
+        .out_deb_path = test_deb,
+        .file_mappings = &.{
+            .{
+                .src = test_root_src,
+                .dest = "",
+            },
+            .{
+                .src = "src/main.zig",
+                .dest = "/var/www/site/main.zig",
+                .mode = 0o644,
+            },
+        },
+    };
+
+    const out_deb = try packageGeneric(test_io, test_gpa, pkg);
+    defer test_gpa.free(out_deb);
+
+    // Verify deb exists
+    const stat = try Io.Dir.cwd().statFile(test_io, test_deb, .{});
+    try testing.expect(stat.size > 0);
+}
+
+
