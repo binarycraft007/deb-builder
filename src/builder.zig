@@ -57,6 +57,9 @@ pub const PackageDefinition = struct {
     postrm_script: ?[]const u8 = null,
     postrm_file: ?[]const u8 = null,
 
+    conffiles: ?[]const u8 = null,
+    conffiles_file: ?[]const u8 = null,
+
     file_mappings: []const FileMapping = &.{},
     symlinks: []const SymlinkMapping = &.{},
     out_dir: []const u8 = "packages",
@@ -221,6 +224,7 @@ pub fn attachScript(io: Io, b: *deb.Builder, inline_script: ?[]const u8, file_pa
             content = fc;
         } else |_| {}
     }
+
     if (content) |c| {
         switch (kind) {
             .preinst => try b.setPreinst(c),
@@ -228,6 +232,19 @@ pub fn attachScript(io: Io, b: *deb.Builder, inline_script: ?[]const u8, file_pa
             .prerm => try b.setPrerm(c),
             .postrm => try b.setPostrm(c),
         }
+    }
+}
+
+pub fn attachConffiles(io: Io, b: *deb.Builder, inline_conf: ?[]const u8, file_path: ?[]const u8) !void {
+    var content: ?[]const u8 = inline_conf;
+    if (file_path) |p| {
+        if (Io.Dir.cwd().readFileAlloc(io, p, b.arena.allocator(), .unlimited)) |fc| {
+            content = fc;
+        } else |_| {}
+    }
+
+    if (content) |c| {
+        try b.setConffiles(c);
     }
 }
 
@@ -342,6 +359,8 @@ pub fn packageGeneric(io: Io, gpa: mem.Allocator, pkg: PackageDefinition) ![]u8 
     try attachScript(io, &b, pkg.postinst_script, pkg.postinst_file, .postinst);
     try attachScript(io, &b, pkg.prerm_script, pkg.prerm_file, .prerm);
     try attachScript(io, &b, pkg.postrm_script, pkg.postrm_file, .postrm);
+
+    try attachConffiles(io, &b, pkg.conffiles, pkg.conffiles_file);
 
     const FileItem = struct {
         content: []const u8,
@@ -1162,5 +1181,3 @@ test "packageGeneric handles empty dest and leading slash without duplicate entr
     const stat = try Io.Dir.cwd().statFile(test_io, test_deb, .{});
     try testing.expect(stat.size > 0);
 }
-
-
